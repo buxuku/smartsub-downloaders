@@ -1,0 +1,102 @@
+# buxuku/smartsub-downloaders 的构建流水线（此文件为主仓内的版本控制副本，
+# 实际生效位置：smartsub-downloaders 仓库 .github/workflows/build.yml）。
+#
+# 职责：汇集 yt-dlp 官方 release 产物 + 从 iawia002/lux master 源码交叉编译，
+# 统一命名后连同 downloader-versions.json 清单发布到 `latest` rolling release。
+# SmartSub 应用内的下载器安装/更新（main/helpers/downloaderManager.ts）消费该 release。
+#
+# 触发：每周一 04:00 UTC 定时 + 手动 dispatch（站点破坏性变化时手动触发推新版）。
+name: Build downloaders dist
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve yt-dlp latest version
+        id: ytdlp
+        run: |
+          TAG=$(curl -fsSL https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest | jq -r .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "yt-dlp latest: $TAG"
+
+      - name: Download yt-dlp official binaries
+        run: |
+          mkdir -p dist
+          BASE="https://github.com/yt-dlp/yt-dlp/releases/download/${{ steps.ytdlp.outputs.tag }}"
+          curl -fsSL -o dist/yt-dlp-win32-x64.exe   "$BASE/yt-dlp.exe"
+          curl -fsSL -o dist/yt-dlp-win32-arm64.exe "$BASE/yt-dlp_arm64.exe"
+          curl -fsSL -o dist/yt-dlp-macos           "$BASE/yt-dlp_macos"
+          curl -fsSL -o dist/yt-dlp-linux-x64       "$BASE/yt-dlp_linux"
+          curl -fsSL -o dist/yt-dlp-linux-arm64     "$BASE/yt-dlp_linux_aarch64"
+          # 官方 SHA2-256SUMS 校验（防搬运途中损坏）
+          curl -fsSL -o /tmp/SHA2-256SUMS "$BASE/SHA2-256SUMS"
+          cd dist
+          for pair in "yt-dlp.exe yt-dlp-win32-x64.exe" \
+                      "yt-dlp_arm64.exe yt-dlp-win32-arm64.exe" \
+                      "yt-dlp_macos yt-dlp-macos" \
+                      "yt-dlp_linux yt-dlp-linux-x64" \
+                      "yt-dlp_linux_aarch64 yt-dlp-linux-arm64"; do
+            set -- $pair
+            expected=$(grep "  $1$" /tmp/SHA2-256SUMS | cut -d' ' -f1)
+            actual=$(sha256sum "$2" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "checksum mismatch for $1 ($2)"; exit 1
+            fi
+          done
+
+      - name: Build lux from master
+        id: lux
+        run: |
+          git clone --depth 1 https://github.com/iawia002/lux.git /tmp/lux
+          cd /tmp/lux
+          LUX_VERSION=$(date -u +'%Y.%m.%d')
+          LUX_SHA=$(git rev-parse --short HEAD)
+          echo "version=$LUX_VERSION" >> "$GITHUB_OUTPUT"
+          echo "building lux $LUX_VERSION ($LUX_SHA)"
+          build() {
+            GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=$LUX_VERSION-$LUX_SHA" \
+              -o "$GITHUB_WORKSPACE/dist/$3" .
+          }
+          build windows amd64 lux-win32-x64.exe
+          build windows arm64 lux-win32-arm64.exe
+          build darwin  amd64 lux-darwin-x64
+          build darwin  arm64 lux-darwin-arm64
+          build linux   amd64 lux-linux-x64
+          build linux   arm64 lux-linux-arm64
+
+      - name: Build manifest
+        run: |
+          node build-manifest.mjs --dist dist \
+            --ytdlp "${{ steps.ytdlp.outputs.tag }}" \
+            --lux "${{ steps.lux.outputs.version }}"
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # rolling release：删 tag 级联清空旧资产后重建，保证同名文件真覆盖
+          gh release delete latest --cleanup-tag -y || true
+          gh release create latest dist/* \
+            --title "Latest downloader builds" \
+            --notes "yt-dlp ${{ steps.ytdlp.outputs.tag }} (official) + lux ${{ steps.lux.outputs.version }} (built from iawia002/lux master). Auto-published; consumed by SmartSub in-app installer."
