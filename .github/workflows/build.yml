@@ -75,7 +75,7 @@ jobs:
           echo "building lux $LUX_VERSION ($LUX_SHA)"
           build() {
             GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=$LUX_VERSION-$LUX_SHA" \
+              go build -trimpath -ldflags "-s -w -X github.com/iawia002/lux/app.version=$LUX_VERSION-$LUX_SHA" \
               -o "$GITHUB_WORKSPACE/dist/$3" .
           }
           build windows amd64 lux-win32-x64.exe
