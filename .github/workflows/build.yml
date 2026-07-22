@@ -1,9 +1,7 @@
-# buxuku/smartsub-downloaders 的构建流水线（此文件为主仓内的版本控制副本，
-# 实际生效位置：smartsub-downloaders 仓库 .github/workflows/build.yml）。
-#
 # 职责：汇集 yt-dlp 官方 release 产物 + 从 iawia002/lux master 源码交叉编译，
 # 统一命名后连同 downloader-versions.json 清单发布到 `latest` rolling release。
-# SmartSub 应用内的下载器安装/更新（main/helpers/downloaderManager.ts）消费该 release。
+# SmartSub 应用内的下载器安装/更新（main/helpers/downloaderManager.ts）消费该 release，
+# 资产命名/清单结构与主仓的跨仓契约见 SmartSub 主仓 scripts/downloaders-dist/README.md。
 #
 # 触发：每周一 04:00 UTC 定时 + 手动 dispatch（站点破坏性变化时手动触发推新版）。
 name: Build downloaders dist
