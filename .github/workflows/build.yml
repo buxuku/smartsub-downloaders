@@ -4,19 +4,74 @@
 # 资产命名/清单结构与主仓的跨仓契约见 SmartSub 主仓 scripts/downloaders-dist/README.md。
 #
 # 触发：每周一 04:00 UTC 定时 + 手动 dispatch（站点破坏性变化时手动触发推新版）。
+#
+# 门控：每次触发都先跑 check（scripts/check-upstream.sh），只有「yt-dlp 官方发了新版本」
+# 或「lux master 有新提交」（对照已发布清单）才构建并重发 release；上游没变则 build 整个
+# 跳过，release / 清单 / 二进制保持原样 —— 应用不会误报更新，国内镜像同步也无需重传。
+# 手动 dispatch 勾选 force 可忽略比较强制重建（如改了本仓流水线后想重新发布）。
 name: Build downloaders dist
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新构建并发布（忽略上游是否有变化）'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 4 * * 1'
 
 permissions:
-  contents: write
+  contents: read
+
+# 同一时刻只跑一个：避免 check 读到「正在删除重建」中的 release
+concurrency:
+  group: build-downloaders
+  cancel-in-progress: false
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write # 仅供下方 keepalive 步骤调用 enable workflow API
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      ytdlp_tag: ${{ steps.upstream.outputs.ytdlp_tag }}
+      lux_sha: ${{ steps.upstream.outputs.lux_sha }}
+      lux_date: ${{ steps.upstream.outputs.lux_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare upstream with the published manifest
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+        run: bash scripts/check-upstream.sh
+
+      # 公开仓库「60 天无仓库活动」会被 GitHub 自动停用定时任务（官方文档未定义「活动」，
+      # 实测提交算、评论不算）。门控后上游长期无变化时不再产生 release，这里对已启用的
+      # workflow 重复 enable 来重置计时（不产生提交）。尽力而为，失败不影响主流程。
+      - name: Keep the scheduled workflow enabled
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # 构建严格对应 check 判定时的上游状态：yt-dlp 用判定时的 tag，
+      # lux 固定到判定时的 commit，版本号取该提交的 UTC 日期（同一提交永远同一版本号）。
+      YTDLP_TAG: ${{ needs.check.outputs.ytdlp_tag }}
+      LUX_SHA: ${{ needs.check.outputs.lux_sha }}
+      LUX_VERSION: ${{ needs.check.outputs.lux_date }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,17 +85,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Resolve yt-dlp latest version
-        id: ytdlp
-        run: |
-          TAG=$(curl -fsSL https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest | jq -r .tag_name)
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "yt-dlp latest: $TAG"
-
       - name: Download yt-dlp official binaries
         run: |
           mkdir -p dist
-          BASE="https://github.com/yt-dlp/yt-dlp/releases/download/${{ steps.ytdlp.outputs.tag }}"
+          BASE="https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_TAG}"
           curl -fsSL -o dist/yt-dlp-win32-x64.exe   "$BASE/yt-dlp.exe"
           curl -fsSL -o dist/yt-dlp-win32-arm64.exe "$BASE/yt-dlp_arm64.exe"
           curl -fsSL -o dist/yt-dlp-macos           "$BASE/yt-dlp_macos"
@@ -62,18 +110,19 @@ jobs:
             fi
           done
 
-      - name: Build lux from master
-        id: lux
+      - name: Build lux from the pinned master commit
         run: |
-          git clone --depth 1 https://github.com/iawia002/lux.git /tmp/lux
+          # 固定到 check 判定的 commit（而不是此刻的 HEAD），保证构建内容与判定一致
+          git init -q /tmp/lux
           cd /tmp/lux
-          LUX_VERSION=$(date -u +'%Y.%m.%d')
-          LUX_SHA=$(git rev-parse --short HEAD)
-          echo "version=$LUX_VERSION" >> "$GITHUB_OUTPUT"
-          echo "building lux $LUX_VERSION ($LUX_SHA)"
+          git remote add origin https://github.com/iawia002/lux.git
+          git fetch -q --depth 1 origin "$LUX_SHA"
+          git checkout -q FETCH_HEAD
+          LUX_SHORT=$(git rev-parse --short HEAD)
+          echo "building lux $LUX_VERSION ($LUX_SHORT)"
           build() {
             GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X github.com/iawia002/lux/app.version=$LUX_VERSION-$LUX_SHA" \
+              go build -trimpath -ldflags "-s -w -X github.com/iawia002/lux/app.version=$LUX_VERSION-$LUX_SHORT" \
               -o "$GITHUB_WORKSPACE/dist/$3" .
           }
           build windows amd64 lux-win32-x64.exe
@@ -86,8 +135,9 @@ jobs:
       - name: Build manifest
         run: |
           node build-manifest.mjs --dist dist \
-            --ytdlp "${{ steps.ytdlp.outputs.tag }}" \
-            --lux "${{ steps.lux.outputs.version }}"
+            --ytdlp "$YTDLP_TAG" \
+            --lux "$LUX_VERSION" \
+            --lux-commit "$LUX_SHA"
 
       - name: Publish rolling release
         env:
@@ -97,4 +147,4 @@ jobs:
           gh release delete latest --cleanup-tag -y || true
           gh release create latest dist/* \
             --title "Latest downloader builds" \
-            --notes "yt-dlp ${{ steps.ytdlp.outputs.tag }} (official) + lux ${{ steps.lux.outputs.version }} (built from iawia002/lux master). Auto-published; consumed by SmartSub in-app installer."
+            --notes "yt-dlp ${YTDLP_TAG} (official) + lux ${LUX_VERSION} (built from iawia002/lux master @ ${LUX_SHA:0:7}). Auto-published; consumed by SmartSub in-app installer."
